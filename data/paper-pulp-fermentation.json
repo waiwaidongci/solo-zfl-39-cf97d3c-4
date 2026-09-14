@@ -1,0 +1,35 @@
+{
+  "items": [
+    {
+      "code": "PF-001",
+      "source": "构树皮",
+      "vat": "三号缸",
+      "days": 6,
+      "owner": "林素",
+      "status": "发酵中",
+      "logs": [
+        {
+          "at": "2026-06-15",
+          "step": "观察",
+          "note": "温度24.6，气味微酸，纤维开始松散",
+          "abnormal": false
+        },
+        {
+          "at": "2026-06-21T03:50:29.658Z",
+          "step": "观察",
+          "note": "温度25.1，微酸，松散"
+        }
+      ],
+      "observations": [
+        {
+          "at": "2026-06-21T03:50:29.658Z",
+          "temperature": "25.1",
+          "smell": "微酸",
+          "fiber": "松散",
+          "changedWater": "是",
+          "abnormal": false
+        }
+      ]
+    }
+  ]
+}
