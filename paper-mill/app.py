@@ -21,7 +21,7 @@ import json
 import os
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -51,14 +51,52 @@ def now_iso():
 def parse_ts(value):
     if not isinstance(value, str):
         raise ApiError(400, "bad_time", "时间必须是 ISO 8601 字符串")
+    text = value.strip()
+    if not text:
+        raise ApiError(400, "bad_time", "时间不能为空")
+    if text.endswith(("Z", "z")):  # Python 3.10 及更早不认 Z 后缀
+        text = text[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(value)
+        return datetime.fromisoformat(text)
     except ValueError:
         raise ApiError(400, "bad_time", f"无法解析时间：{value}")
 
 
-def norm_ts(value):
-    return parse_ts(value).replace(microsecond=0).isoformat()
+def parse_window(start_raw, end_raw):
+    """
+    解析排期时段，统一按真实时刻（UTC）比较：
+      * 起止时间必须都提供且可解析，否则 400 bad_time；
+      * 起止时间要么都带时区偏移、要么都不带（按服务器本地时间解释），
+        混用直接 400 bad_time_mixed_tz，绝不落到服务器内部错误；
+      * 返回 (start_utc, end_utc, 带偏移与否)，时间截到秒并换算为 UTC。
+    """
+    if start_raw is None or end_raw is None:
+        raise ApiError(400, "bad_time", "start 与 end 必须同时提供")
+    start = parse_ts(start_raw)
+    end = parse_ts(end_raw)
+    if (start.tzinfo is None) != (end.tzinfo is None):
+        raise ApiError(
+            400, "bad_time_mixed_tz",
+            "起止时间必须同时带时区偏移或同时不带（本地时间），不可混用："
+            f"start={start_raw}，end={end_raw}",
+        )
+    aware = start.tzinfo is not None
+    # naive 时间按服务器本地时区解释，再统一换算 UTC；aware 时间直接换算
+    start_utc = (start if aware else start.astimezone()).astimezone(timezone.utc)
+    end_utc = (end if aware else end.astimezone()).astimezone(timezone.utc)
+    start_utc = start_utc.replace(microsecond=0)
+    end_utc = end_utc.replace(microsecond=0)
+    if end_utc <= start_utc:
+        raise ApiError(
+            400, "bad_time",
+            f"结束时刻必须晚于开始时刻（按真实时间）：start={start_raw}，end={end_raw}",
+        )
+    return start_utc, end_utc, aware
+
+
+def utc_iso(dt_utc):
+    """UTC datetime -> 统一偏移格式的 ISO 字符串（+00:00），字典序即可比较。"""
+    return dt_utc.isoformat()
 
 
 def to_grams(value, field="weight_kg"):
@@ -366,16 +404,16 @@ class MillService:
         team = body.get("team")
         if not machine or not team:
             raise ApiError(400, "bad_schedule", "machine 与 team 必填")
-        start = norm_ts(body.get("start"))
-        end = norm_ts(body.get("end"))
-        if parse_ts(end) <= parse_ts(start):
-            raise ApiError(400, "bad_time", "结束时间必须晚于开始时间")
+        # 入参阶段就把时段换算成 UTC 真实时刻；混用/非法/逆序在此处即 400
+        start_dt, end_dt, aware = parse_window(body.get("start"), body.get("end"))
+        start = utc_iso(start_dt)
+        end = utc_iso(end_dt)
 
         def fn(conn):
             wo = self._get(conn, "work_orders", body.get("work_order"), "work_order_not_found")
             if wo["status"] != "created":
                 raise ApiError(409, "already_scheduled", f"工单 {wo['code']} 已排产")
-            # 半开区间重叠：同一纸槽 或 同一班组 任一冲突即拒绝
+            # 半开区间重叠（UTC 真实时刻比较）：同一纸槽 或 同一班组 任一冲突即拒绝
             clash = conn.execute(
                 "SELECT machine, team, start_ts, end_ts FROM schedules "
                 "WHERE ? < end_ts AND ? > start_ts AND (machine=? OR team=?)",
@@ -385,7 +423,7 @@ class MillService:
                 reason = "纸槽" if clash["machine"] == machine else "班组"
                 raise ApiError(
                     409, "schedule_conflict",
-                    f"排期冲突：{reason}在 {clash['start_ts']}~{clash['end_ts']} 已被占用",
+                    f"排期冲突：{reason}在 UTC {clash['start_ts']}~{clash['end_ts']} 已被占用",
                 )
             cur = conn.execute(
                 "INSERT INTO schedules(work_order_id, machine, team, start_ts, end_ts, created_at) "
@@ -394,7 +432,9 @@ class MillService:
             )
             conn.execute("UPDATE work_orders SET status='scheduled' WHERE id=?", (wo["id"],))
             row = conn.execute("SELECT * FROM schedules WHERE id=?", (cur.lastrowid,)).fetchone()
-            return {"schedule": self._schedule_dict(conn, row)}
+            out = self._schedule_dict(conn, row)
+            out["timezone_basis"] = "offset_utc" if aware else "server_local_as_utc"
+            return {"schedule": out}
         return self._txn("schedule_work_order", body, role, "planner", fn)
 
     def register_roll(self, body, role):

@@ -235,6 +235,132 @@ def main():
                       role="planner", expect=409)
     check("工单重复排产被拒", e3["error"] == "already_scheduled")
 
+    # -------------------------------- 跨时区回归（漏洞修复）
+    # 基准时段（绝对时刻 UTC）：2026-10-01 00:00Z ~ 08:00Z
+    for i in range(5, 14):
+        c.call("/api/work-orders",
+               {"code": f"WO-{i}", "product_gsm": 80, "planned_kg": 100},
+               role="planner", expect=200)
+
+    # 用 +00:00 书写基准排期：跨时区槽 / 跨班
+    code, tza = c.call("/api/schedules",
+                       {"work_order": "WO-5", "machine": "跨时区槽", "team": "跨班",
+                        "start": "2026-10-01T00:00:00+00:00",
+                        "end":   "2026-10-01T08:00:00+00:00"},
+                       role="planner", key="K-TZ-A", expect=200)
+    check("带偏移时段排期成功，存储统一归一到 UTC（+00:00）",
+          tza["schedule"]["start"] == "2026-10-01T00:00:00+00:00"
+          and tza["schedule"]["end"] == "2026-10-01T08:00:00+00:00"
+          and tza["schedule"]["timezone_basis"] == "offset_utc")
+
+    # 同一绝对时段，改用 +08:00 书写（08:00+08 ~ 16:00+08 == 00:00Z ~ 08:00Z）→ 必须冲突
+    code, tz1 = c.call("/api/schedules",
+                       {"work_order": "WO-6", "machine": "跨时区槽", "team": "另班",
+                        "start": "2026-10-01T08:00:00+08:00",
+                        "end":   "2026-10-01T16:00:00+08:00"},
+                       role="planner", key="K-TZ-1", expect=409)
+    check("跨时区完全重叠（+08:00 等值写法）被拒（漏洞回归）",
+          tz1["error"] == "schedule_conflict")
+
+    # 部分重叠，再换一个偏移 +05:30（03:30+05:30 ~ 11:00+05:30 == 前 22:00Z ~ 05:30Z…取真实重叠段）
+    # 06:00Z~10:00Z 写成 +08:00 = 14:00~18:00，与基准 00:00Z~08:00Z 在 06:00~08:00 重叠
+    code, tz2 = c.call("/api/schedules",
+                       {"work_order": "WO-7", "machine": "新槽A", "team": "跨班",
+                        "start": "2026-10-01T14:00:00+08:00",
+                        "end":   "2026-10-01T18:00:00+08:00"},
+                       role="planner", key="K-TZ-2", expect=409)
+    check("仅班组相同、跨时区部分重叠被拒（纸槽不同也不行）",
+          tz2["error"] == "schedule_conflict")
+
+    code, tz3 = c.call("/api/schedules",
+                       {"work_order": "WO-8", "machine": "跨时区槽", "team": "新班B",
+                        "start": "2026-10-01T14:00:00+08:00",
+                        "end":   "2026-10-01T18:00:00+08:00"},
+                       role="planner", key="K-TZ-3", expect=409)
+    check("仅纸槽相同、跨时区部分重叠被拒", tz3["error"] == "schedule_conflict")
+
+    # 首尾相接（不同偏移写法）：基准 08:00Z 结束，新排期 08:00Z 开始，写成 +05:30 → 允许
+    code, tz4 = c.call("/api/schedules",
+                       {"work_order": "WO-9", "machine": "跨时区槽", "team": "跨班",
+                        "start": "2026-10-01T13:30:00+05:30",   # == 08:00Z
+                        "end":   "2026-10-01T17:30:00+05:30"},  # == 12:00Z
+                       role="planner", key="K-TZ-4", expect=200)
+    check("跨时区首尾相接（08:00Z 接 08:00Z）仍允许",
+          tz4["schedule"]["start"] == "2026-10-01T08:00:00+00:00")
+
+    # 另一侧重叠 1 秒也要拒：07:59:59Z 开始（写成 +08:00 = 15:59:59）
+    code, tz5 = c.call("/api/schedules",
+                       {"work_order": "WO-10", "machine": "跨时区槽", "team": "隔班",
+                        "start": "2026-10-01T15:59:59+08:00",
+                        "end":   "2026-10-01T19:00:00+08:00"},
+                       role="planner", key="K-TZ-5", expect=409)
+    check("跨时区相差 1 秒的重叠仍被拒（按真实时刻，不是字符串）",
+          tz5["error"] == "schedule_conflict")
+
+    # 非法/混用时间：明确 400，不得 500
+    code, bad1 = c.call("/api/schedules",
+                        {"work_order": "WO-11", "machine": "非法槽", "team": "甲班",
+                         "start": "2026-10-02T08:00:00+08:00",
+                         "end":   "2026-10-02T12:00:00"},  # 不带偏移
+                        role="planner", key="K-TZ-BAD1", expect=400)
+    check("起始带偏移、结束不带（混用）→ 400 bad_time_mixed_tz",
+          bad1["error"] == "bad_time_mixed_tz")
+    code, bad2 = c.call("/api/schedules",
+                        {"work_order": "WO-11", "machine": "非法槽", "team": "甲班",
+                         "start": "2026-10-02T08:00:00",
+                         "end":   "2026-10-02T12:00:00+00:00"},  # 反向混用
+                        role="planner", key="K-TZ-BAD2", expect=400)
+    check("起始不带偏移、结束带偏移 → 400 bad_time_mixed_tz",
+          bad2["error"] == "bad_time_mixed_tz")
+    code, bad3 = c.call("/api/schedules",
+                        {"work_order": "WO-11", "machine": "非法槽", "team": "甲班",
+                         "start": "2026-10-02 上午八点", "end": "2026-10-02T12:00:00"},
+                        role="planner", key="K-TZ-BAD3", expect=400)
+    check("无法解析的时间字符串 → 400 bad_time（非 500）", bad3["error"] == "bad_time")
+    code, bad4 = c.call("/api/schedules",
+                        {"work_order": "WO-11", "machine": "非法槽", "team": "甲班",
+                         "start": "2026-10-02T08:00:00+00:00"},  # 缺 end
+                        role="planner", key="K-TZ-BAD4", expect=400)
+    check("缺少结束时间 → 400 bad_time", bad4["error"] == "bad_time")
+    code, bad5 = c.call("/api/schedules",
+                        {"work_order": "WO-11", "machine": "非法槽", "team": "甲班",
+                         "start": "2026-10-02T12:00:00+00:00",
+                         "end":   "2026-10-02T20:00:00+08:00"},  # 12:00Z vs 12:00Z？end=12Z 等于 start
+                        role="planner", key="K-TZ-BAD5", expect=400)
+    check("跨时区换算后结束不晚于开始（等值）→ 400 bad_time", bad5["error"] == "bad_time")
+    code, bad6 = c.call("/api/schedules",
+                        {"work_order": "WO-11", "machine": "非法槽", "team": "甲班",
+                         "start": 1759363200, "end": 1759392000},  # 数字时间戳
+                        role="planner", key="K-TZ-BAD6", expect=400)
+    check("非字符串时间 → 400 bad_time（非 500）", bad6["error"] == "bad_time")
+
+    # Z 后缀（UTC 简写）合法且与 +00:00 等值；与前面 12:00Z 首尾相接
+    code, tz6 = c.call("/api/schedules",
+                       {"work_order": "WO-12", "machine": "Z槽", "team": "Z班",
+                        "start": "2026-10-01T12:00:00Z",
+                        "end":   "2026-10-01T14:00:00Z"},
+                       role="planner", key="K-TZ-6", expect=200)
+    check("Z 后缀（UTC）可解析，归一为 +00:00 且与既有排期相接不冲突",
+          tz6["schedule"]["start"] == "2026-10-01T12:00:00+00:00")
+
+    # 不带偏移的本地时间仍可用，但同样归一为 UTC 存储
+    code, tz7 = c.call("/api/schedules",
+                       {"work_order": "WO-13", "machine": "本地槽", "team": "本地班",
+                        "start": "2026-11-01T08:00:00", "end": "2026-11-01T12:00:00"},
+                       role="planner", key="K-TZ-7", expect=200)
+    check("不带偏移按服务器本地时间解释，存储仍归一 UTC",
+          tz7["schedule"]["start"].endswith("+00:00")
+          and tz7["schedule"]["timezone_basis"] == "server_local_as_utc")
+
+    # 非法时间请求不得改变工单状态（仍可对 WO-11 正常排产）
+    code, tz8 = c.call("/api/schedules",
+                       {"work_order": "WO-11", "machine": "本地槽", "team": "本地班",
+                        "start": "2026-11-02T08:00:00", "end": "2026-11-02T12:00:00"},
+                       role="planner", key="K-TZ-8", expect=200)
+    check("被 400 拒绝的排期不留痕迹：同工单同班槽可正常改日排产",
+          tz8["schedule"]["team"] == "本地班")
+
+
     # ------------------------------------------------ 三、重复提交（幂等）
     section("三、重复提交：重放原结果，键不得跨操作复用")
 
