@@ -20,6 +20,7 @@
 import json
 import os
 import sqlite3
+import sys
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,6 +41,10 @@ class ApiError(Exception):
         self.status = status
         self.code = code
         self.message = message or code
+
+
+class MigrationError(Exception):
+    """启动迁移失败：此时原库必须保持未改动。"""
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -116,6 +121,12 @@ def require_gsm(value, field="gsm"):
 
 
 # ---------------------------------------------------------------- 数据库
+
+# 当前库版本（写入 PRAGMA user_version）：
+#   0 = 旧版（排期可能以带偏移/本地朴素时间的字符串原样保存，比较口径不统一）
+#   1 = 所有 schedules.start_ts/end_ts 统一为 UTC（+00:00）真实时刻
+SCHEMA_VERSION = 1
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_orders (
@@ -235,15 +246,13 @@ CREATE TABLE IF NOT EXISTS idempotency (
 
 
 def connect(db_path=DB_PATH):
-    fresh = not os.path.exists(db_path)
+    """请求期连接：假定库已由 bootstrap 建好/迁好。"""
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=10, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=10000")
-    if fresh:
-        init_db(conn)
     return conn
 
 
@@ -251,15 +260,128 @@ def init_db(conn):
     conn.executescript(SCHEMA)
 
 
+def _legacy_to_utc(raw):
+    """
+    解释一条历史排期时间，保义换算为 UTC：
+      * 带偏移：按其表达的绝对时刻换算（含义不变）；
+      * 不带偏移：按服务器本地时区解释（与新输入 parse_window 的口径一致）。
+    无法解析时抛 MigrationError，由调用方决定放弃整个迁移。
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise MigrationError(f"历史时间非法：{raw!r}")
+    dt = parse_ts(raw)  # parse_ts 已把 Z 归一为 +00:00，非法时抛 ApiError
+    aware = dt.tzinfo is not None
+    dt_utc = (dt if aware else dt.astimezone()).astimezone(timezone.utc)
+    return utc_iso(dt_utc.replace(microsecond=0))
+
+
+def migrate_legacy_db(db_path):
+    """
+    把版本 0 的旧库迁移到版本 1：schedules 时段统一为 UTC。
+
+    原子性保证：
+      1. 用一条只读连接（默认 journal 模式、不建表、不切 WAL）先把所有历史行
+         在内存里换算成功；任一行失败则直接抛错，全程没有任何写操作 → 原库字节不变；
+      2. 全部可迁后才 BEGIN IMMEDIATE，在同一事务里更新所有行并置 user_version=1，
+         中途任何错误整体回滚（含注入故障），不留半迁状态；
+      3. user_version 与数据同进同退，重启会重新迁移，且迁移是幂等的。
+    """
+    if not os.path.exists(db_path):
+        return "fresh"
+
+    # ---- 只读预检连接：绝不切 WAL、绝不写 ----
+    # query_only 是连接级硬保险：该连接上任何非查询语句都被拒绝，
+    # 保证“预检阶段对原库零写入”，旧库即使是 WAL 模式也一样。
+    probe = sqlite3.connect(db_path, timeout=10, isolation_level=None)
+    try:
+        probe.execute("PRAGMA query_only=ON")
+        version = probe.execute("PRAGMA user_version").fetchone()[0]
+        if version >= SCHEMA_VERSION:
+            return "current"
+        try:
+            rows = probe.execute("SELECT id, start_ts, end_ts FROM schedules").fetchall()
+        except sqlite3.OperationalError:
+            # 旧库但缺表（极早期半成品）：没有需要保的数据，交给建表流程
+            return "needs_schema"
+    finally:
+        probe.close()
+
+    # ---- 内存预转换：任何一行失败都在写事务之前中止 ----
+    converted = []
+    for rid, start_raw, end_raw in rows:
+        try:
+            start_utc = _legacy_to_utc(start_raw)
+            end_utc = _legacy_to_utc(end_raw)
+        except ApiError as exc:
+            raise MigrationError(f"排期 #{rid} 时间无法迁移（{exc.message}），已放弃迁移、原库未改动")
+        if end_utc <= start_utc:
+            raise MigrationError(
+                f"排期 #{rid} 迁移后结束不晚于开始（{start_utc} ~ {end_utc}），已放弃迁移、原库未改动"
+            )
+        converted.append((start_utc, end_utc, rid))
+
+    # ---- 全部可迁：单事务落库 ----
+    conn = sqlite3.connect(db_path, timeout=10, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for start_utc, end_utc, rid in converted:
+            conn.execute(
+                "UPDATE schedules SET start_ts=?, end_ts=? WHERE id=?",
+                (start_utc, end_utc, rid),
+            )
+        # 测试用：在迁移事务提交前注入失败，验证半迁回滚
+        if os.environ.get("MILL_FAIL_MIGRATION") == "1":
+            raise MigrationError("注入故障：模拟迁移提交前失败")
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        conn.close()
+        raise
+    conn.close()
+    return "migrated"
+
+
+def bootstrap(db_path):
+    """
+    启动引导：新建库，或把旧库原子迁移到当前版本后补齐表结构。
+    迁移失败时抛出 MigrationError，调用方应退出且不得继续服务。
+    """
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    fresh = not os.path.exists(db_path)
+
+    if fresh:
+        conn = connect(db_path)
+        try:
+            # executescript 自身会提交 DDL；随后把版本号写入文件头
+            init_db(conn)
+            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        finally:
+            conn.close()
+        return "fresh"
+
+    outcome = migrate_legacy_db(db_path)
+    if outcome == "needs_schema":
+        conn = connect(db_path)
+        try:
+            init_db(conn)
+            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        finally:
+            conn.close()
+        return "initialized"
+    return outcome
+
+
 # ---------------------------------------------------------------- 服务层
 
 class MillService:
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
-        # 启动即建库；并发首写由 BEGIN IMMEDIATE 串行化
-        conn = connect(db_path)
-        init_db(conn)
-        conn.close()
+        # 启动引导：旧库原子迁移到 UTC 口径；迁移失败抛 MigrationError，不提供服务
+        self.bootstrap_outcome = bootstrap(db_path)
 
     # ---- 事务骨架：鉴权 → 即时事务 → 幂等重放/登记 → 提交 ----
     def _txn(self, op, body, role, need_role, fn):
@@ -855,7 +977,13 @@ def serve(db_path=DB_PATH, port=None):
 
 
 if __name__ == "__main__":
-    httpd = serve()
+    try:
+        httpd = serve()
+    except MigrationError as exc:
+        # 迁移失败：绝不能带半迁/错误口径的库继续服务，非零退出
+        print(f"启动失败：数据库迁移未完成，原库未改动。原因：{exc}", file=sys.stderr)
+        sys.exit(2)
+    outcome = getattr(Handler.service, "bootstrap_outcome", "current")
     print(f"纸坊抄纸排产与成品发货系统 listening on http://127.0.0.1:{httpd.server_address[1]}")
-    print(f"数据库：{DB_PATH}")
+    print(f"数据库：{DB_PATH}（启动引导：{outcome}）")
     httpd.serve_forever()

@@ -14,8 +14,10 @@
 import json
 import os
 import atexit
+import hashlib
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -106,6 +108,113 @@ def wait_exit(proc, timeout=10):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+
+
+sys.path.insert(0, HERE)
+import app as appmod  # noqa: E402  仅用于取 SCHEMA 手工构造“旧版库”
+
+
+LEGACY_DIR = os.path.join(HERE, "data-legacy")
+
+
+def _rmtree_quiet(path):
+    if os.path.exists(path):
+        shutil.rmtree(path)
+
+
+def build_legacy_db(db_path, raw_schedules, wo_count=None):
+    """
+    按升级前版本手工造库：user_version=0，排期时间原样保存（带偏移/本地朴素串）。
+    raw_schedules: [(machine, team, start_raw, end_raw), ...]
+    """
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    if os.path.exists(db_path):
+        os.remove(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(appmod.SCHEMA)
+        conn.execute("PRAGMA user_version=0")  # 显式标记为旧版
+        n = wo_count if wo_count is not None else len(raw_schedules)
+        for i in range(n):
+            conn.execute(
+                "INSERT INTO work_orders(code,product_gsm,planned_g,status,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (f"OLD-{i+1}", 80, 100000, "scheduled", "t"),
+            )
+        for i, (machine, team, s_raw, e_raw) in enumerate(raw_schedules):
+            conn.execute(
+                "INSERT INTO schedules(work_order_id,machine,team,start_ts,end_ts,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (i + 1, machine, team, s_raw, e_raw, "t"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def start_migration_server(db_path, port, extra_env=None, tz="Asia/Shanghai"):
+    """在指定库、指定服务器时区上启动新版本服务（会触发启动迁移）。"""
+    env = dict(os.environ, MILL_DB=db_path, MILL_PORT=str(port), TZ=tz)
+    if extra_env:
+        env.update(extra_env)
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(HERE, "app.py")],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1) as r:
+                if r.status == 200:
+                    _CHILDREN.append(proc)
+                    return proc
+        except Exception:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.15)
+    return proc  # 可能已退出，调用方检查 returncode
+
+
+def start_expect_crash(db_path, port, extra_env=None, tz="Asia/Shanghai"):
+    """启动一个预期在迁移阶段失败退出的服务，返回 (returncode, stderr)。"""
+    env = dict(os.environ, MILL_DB=db_path, MILL_PORT=str(port), TZ=tz)
+    if extra_env:
+        env.update(extra_env)
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(HERE, "app.py")],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    _CHILDREN.append(proc)
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    err = proc.stderr.read().decode("utf-8", "replace")
+    return proc.returncode, err
+
+
+def db_user_version(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def db_schedules(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return list(conn.execute("SELECT id, start_ts, end_ts FROM schedules ORDER BY id"))
+    finally:
+        conn.close()
+
+
+def file_sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read())
+    return h.hexdigest()
 
 
 # =====================================================================
@@ -608,6 +717,134 @@ def main():
 
     proc.terminate()
     wait_exit(proc)
+
+    # -------------------------------- 八、旧版库迁移
+    section("八、旧版库迁移：历史排期保义归一 UTC，失败不改原库")
+
+    leg_path = os.path.join(LEGACY_DIR, "mill.db")
+    _rmtree_quiet(LEGACY_DIR)
+
+    # 三种升级前的历史写法共存：带偏移、本地朴素串、Z 后缀
+    build_legacy_db(leg_path, [
+        ("M1", "T1", "2026-12-01T08:00:00+08:00", "2026-12-01T16:00:00+08:00"),
+        ("M2", "T2", "2026-12-02T09:00:00",       "2026-12-02T17:00:00"),
+        ("M3", "T3", "2026-12-03T10:00:00Z",      "2026-12-03T18:00:00Z"),
+    ])
+    mport = free_port()
+    mproc = start_migration_server(leg_path, mport, tz="Asia/Shanghai")
+    mc = Client(mport)
+    check("旧库启动后自动迁移并继续提供服务（进程存活、healthz 200）",
+          mproc.returncode is None)
+    check("迁移后 PRAGMA user_version=1", db_user_version(leg_path) == 1)
+
+    scheds = {r[0]: (r[1], r[2]) for r in db_schedules(leg_path)}
+    check("带偏移历史保义换 UTC（08:00+08 → 00:00Z，绝对时刻不变）",
+          scheds[1] == ("2026-12-01T00:00:00+00:00", "2026-12-01T08:00:00+00:00"))
+    check("本地朴素历史按服务器时区(上海)解释（09:00 本地 → 01:00Z）",
+          scheds[2] == ("2026-12-02T01:00:00+00:00", "2026-12-02T09:00:00+00:00"))
+    check("Z 历史保义换 +00:00",
+          scheds[3] == ("2026-12-03T10:00:00+00:00", "2026-12-03T18:00:00+00:00"))
+
+    def new_wo(client, code):
+        client.call("/api/work-orders",
+                    {"code": code, "product_gsm": 80, "planned_kg": 100},
+                    role="planner", expect=200)
+
+    # 历史排期 vs 新排期：等值但不同时区写法，必须按真实时刻判冲突
+    new_wo(mc, "NEW-1")
+    code, h1 = mc.call("/api/schedules",
+                       {"work_order": "NEW-1", "machine": "M1", "team": "T9",
+                        "start": "2026-12-01T00:00:00Z", "end": "2026-12-01T08:00:00Z"},
+                       role="planner", key="K-MIG-1", expect=409)
+    check("历史(+08:00) vs 新(Z) 等值时段：同槽重叠被拒",
+          h1["error"] == "schedule_conflict")
+
+    new_wo(mc, "NEW-2")
+    code, h2 = mc.call("/api/schedules",
+                       {"work_order": "NEW-2", "machine": "M9", "team": "T2",
+                        "start": "2026-12-02T01:00:00+00:00", "end": "2026-12-02T09:00:00+00:00"},
+                       role="planner", key="K-MIG-2", expect=409)
+    check("历史(本地朴素) vs 新(+00:00) 等值时段：同班重叠被拒",
+          h2["error"] == "schedule_conflict")
+
+    new_wo(mc, "NEW-3")
+    code, h3 = mc.call("/api/schedules",
+                       {"work_order": "NEW-3", "machine": "M3", "team": "T9",
+                        "start": "2026-12-03T18:00:00+08:00",
+                        "end":   "2026-12-04T02:00:00+08:00"},
+                       role="planner", key="K-MIG-3", expect=409)
+    check("历史(Z) vs 新(+08:00) 等值时段：同槽重叠被拒",
+          h3["error"] == "schedule_conflict")
+
+    # 相邻不重叠（与历史时段首尾相接）仍放行
+    new_wo(mc, "NEW-4")
+    code, a1 = mc.call("/api/schedules",
+                       {"work_order": "NEW-4", "machine": "M1", "team": "T1",
+                        "start": "2026-12-01T08:00:00Z", "end": "2026-12-01T10:00:00Z"},
+                       role="planner", key="K-MIG-4", expect=200)
+    check("与历史排期跨时区首尾相接（08:00Z 接 08:00Z）放行",
+          a1["schedule"]["start"] == "2026-12-01T08:00:00+00:00")
+    new_wo(mc, "NEW-5")
+    code, a2 = mc.call("/api/schedules",
+                       {"work_order": "NEW-5", "machine": "M2", "team": "T2",
+                        "start": "2026-12-02T09:00:00Z", "end": "2026-12-02T11:00:00Z"},
+                       role="planner", key="K-MIG-5", expect=200)
+    check("与本地朴素历史排期首尾相接放行", a2["schedule"]["machine"] == "M2")
+
+    # 迁移幂等：重启同一旧库不再迁移、数据不丢
+    mproc.terminate(); wait_exit(mproc)
+    mport2 = free_port()
+    mproc = start_migration_server(leg_path, mport2, tz="Asia/Shanghai")
+    mc = Client(mport2)
+    check("二次启动不再重复迁移（user_version 仍=1），服务正常",
+          mproc.returncode is None and db_user_version(leg_path) == 1)
+    check("迁移+相邻新增共 5 条排期重启后完整",
+          len(db_schedules(leg_path)) == 5)
+    mproc.terminate(); wait_exit(mproc)
+
+    # ---- 迁移失败回滚 A：预检阶段发现非法历史行 → 零写入 ----
+    bad_path = os.path.join(LEGACY_DIR, "bad.db")
+    build_legacy_db(bad_path, [
+        ("M1", "T1", "2026-12-01 上午八点", "2026-12-01T16:00:00+08:00"),
+    ])
+    bad_hash = file_sha(bad_path)
+    rc, err = start_expect_crash(bad_path, free_port())
+    check("非法历史时间：服务拒绝启动并以非零码退出", rc == 2)
+    check("错误信息明确（放弃迁移、原库未改动）", "原库未改动" in err)
+    check("预检失败：user_version 仍为 0", db_user_version(bad_path) == 0)
+    check("预检失败：非法行原样保留",
+          db_schedules(bad_path)[0][1] == "2026-12-01 上午八点")
+    check("预检失败：主库文件字节未改（无任何写入）",
+          file_sha(bad_path) == bad_hash)
+    check("预检失败：未产生 WAL/journal 副作用文件",
+          not os.path.exists(bad_path + "-wal")
+          and not os.path.exists(bad_path + "-journal"))
+
+    # ---- 迁移失败回滚 B：写事务中途注入失败 → 回滚，可重试成功 ----
+    inj_path = os.path.join(LEGACY_DIR, "inject.db")
+    build_legacy_db(inj_path, [
+        ("M1", "T1", "2026-12-01T08:00:00+08:00", "2026-12-01T16:00:00+08:00"),
+        ("M2", "T2", "2026-12-02T08:00:00+08:00", "2026-12-02T16:00:00+08:00"),
+    ])
+    rc, err = start_expect_crash(inj_path, free_port(),
+                                 extra_env={"MILL_FAIL_MIGRATION": "1"})
+    check("迁移提交前注入故障：非零退出", rc == 2 and "原库未改动" in err)
+    check("半迁回滚：user_version 仍为 0", db_user_version(inj_path) == 0)
+    inj_rows = db_schedules(inj_path)
+    check("半迁回滚：两行都保持旧字符串（无一行被半改）",
+          all("+08:00" in r[1] for r in inj_rows))
+
+    # 去掉注入后重启：迁移成功、可继续服务
+    iport = free_port()
+    iproc = start_migration_server(inj_path, iport, tz="Asia/Shanghai")
+    ic = Client(iport)
+    check("故障库去掉注入后重启：迁移成功并提供服务", iproc.returncode is None)
+    check("重试迁移后 user_version=1、历史行全部归一 UTC",
+          db_user_version(inj_path) == 1
+          and db_schedules(inj_path)[0][1] == "2026-12-01T00:00:00+00:00")
+    with urllib.request.urlopen(f"http://127.0.0.1:{iport}/healthz", timeout=5) as r:
+        check("迁移后新库可正常响应", r.status == 200)
+    iproc.terminate(); wait_exit(iproc)
 
     # ------------------------------------------------ 汇总
     section("汇总")
